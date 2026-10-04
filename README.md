@@ -109,7 +109,7 @@ export GUARD_BAND="2.0"
 uvicorn app.main:app --reload
 ```
 
-运行测试（自动使用临时 SQLite 库，共 170+ 个用例）：
+运行测试（自动使用临时 SQLite 库，共 300+ 个用例）：
 
 ```bash
 pip install -r requirements-dev.txt
@@ -632,6 +632,18 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
   （仅待执行项）；`GET /api/revision/{n}` 的批准记录追加 `scheduled` 标志，并附
   `scheduled_approvals[]` 预约审计行。**历史修订标明自动审批且保留原批准事件语义**：
   预约产生的批准是普通批准事件流中一行，只是多了 `scheduled` 标记，永不追改。
+- **预约审计行按修订回放，不读实时行**：预约的每次状态变迁（登记、改期、取消、
+  到期获批、到期阻塞、被其他审批路径失效）都追加一条不可变
+  `scheduled_approval_events`，锚定在其生效的修订号上——登记/改期/取消不占修订号，
+  锚定在操作发生时的当前修订号（同一修订号内按当前状态呈现）；到期获批锚定在它
+  占用的批准修订号；到期阻塞不占修订号，锚定在扫描决定时的当前修订号；失效锚定在
+  触发它的那笔审批（单笔/整组/候补自动/许可交接/紧急占用）的批准修订号。修订快照
+  按 `revision <= n` 回放这些事件：后来才登记的预约**不出现**在较早修订；尚未到达
+  决定修订的预约在旧修订中仍呈现 `scheduled`（待执行），`approval_revision`、
+  `processed_at`、`blocked_details`、`outcome_reason` 等结果字段**不提前泄漏**；
+  到达决定修订后才显示 `approved`/`blocked`/`cancelled`/`invalidated` 及对应结果。
+  每申请至多一条待执行预约的约束不变；既有预约查询接口、修订查询字段与非法修订
+  错误（404 `revision_out_of_range` / 422）保持兼容，历史查询只读。
 
 ### 可用调频位置查询（不改状态）
 
@@ -705,7 +717,9 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
   实时状态。
 - `GET /api/revision/{n}` 还原修订号 **n 当时**的批准、暂停、恢复、撤销记录、
   **当时生效的保护带宽**、带宽变更记录及**当时生效的管制窗口与窗口启用/解除记录**
-  （`n` 超过当前修订号返回 404）。
+  （`n` 超过当前修订号返回 404）。预约审计行同样按 **n 当时**回放：后来才登记的
+  预约不出现，到期获批/失效等结果只从各自决定修订号起可见，更早的修订仍呈现
+  待执行状态（详见「预约自动审批」一节）。
 - `GET /api/revision/compare?base_revision={a}&target_revision={b}`
   对两个已存在修订号做只读复核。返回两侧保护带宽、有效/暂停许可集合、生效管制窗口
   集合及增删集合、区间内按修订号排序的 `approval` / `suspension` / `resumption` /
@@ -1863,6 +1877,52 @@ curl -s http://localhost:8000/api/scheduled-approvals/{预约ID}
 # -> status="invalidated", outcome_reason="manual_approval"；到期扫描不再处理它
 ```
 
+**预约审计按修订回放（不读实时行）**：设申请 5 在修订号 **0** 登记预约，随后在
+修订号 **1** 被手动批准（预约同事务失效）。回查修订号 0 时预约仍是**待执行**，
+不会穿越显示后来的失效；审批修订号等结果字段也不提前泄漏：
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"D\",\"circle\":{\"cx\":0,\"cy\":0,\"radius\":10},
+       \"frequency\":{\"low\":700,\"high\":710},
+       \"time_window\":{\"start\":\"$(date -u -d '+2 days' +%FT%TZ)\",
+                        \"end\":\"$(date -u -d '+3 days' +%FT%TZ)\"}}"
+# -> {"id": 5, "status": "pending", ...}（当前修订号 1）
+
+# 修订号 1 时登记预约（登记不占修订号，自修订号 1 起可见）
+curl -s -X POST http://localhost:8000/api/applications/5/scheduled-approvals \
+  -H 'Content-Type: application/json' \
+  -d "{\"scheduled_at\":\"$(date -u -d '+1 hour' +%FT%TZ)\"}"
+# -> {"id": 9, "status": "scheduled", "current_revision": 1, ...}
+
+# 手动批准申请 5（占用修订号 2），预约同事务失效
+curl -s -X POST http://localhost:8000/api/applications/5/approve \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 1}'
+# -> {"approved": true, "revision": 2, ...}
+
+curl -s http://localhost:8000/api/revision/0
+# 预约在修订号 1 才登记 -> 修订号 0 的审计列表为空：
+# {"revision": 0, "scheduled_approvals": [], ...}
+
+curl -s http://localhost:8000/api/revision/1
+# 失效决定于修订号 2 -> 修订号 1 仍呈现待执行，无结果字段：
+# {"revision": 1, "scheduled_approvals": [{"id": 9, "status": "scheduled",
+#   "approval_revision": null, "outcome_reason": null, ...}], ...}
+
+curl -s http://localhost:8000/api/revision/2
+# 自决定修订号 2 起才显示失效结果：
+# {"revision": 2, "scheduled_approvals": [{"id": 9, "status": "invalidated",
+#   "outcome_reason": "manual_approval", "approval_revision": null, ...}], ...}
+```
+
+整组批准、候补自动批准、许可交接与紧急占用触发的失效同理，各自锚定在对应申请
+的批准修订号（整组中每项各自锚定）；到期获批的预约自其批准修订号起显示
+`approved` 与 `approval_revision`，到期阻塞自扫描决定时的当前修订号起显示
+`blocked` 与 `blocked_details`（阻塞不占修订号）。登记/改期/取消不占修订号，
+锚定在操作发生时的当前修订号——同一修订号内查询即按当前状态呈现（例如登记后
+立即取消，该修订号的快照直接显示 `cancelled`）。
+
 启动可用性：服务重启时先对停机期间到期的预约做一次**补处理**（逻辑与
 `process-due` 完全相同，按重启时刻的带宽/有效许可/窗口重裁），随后才开始接受
 流量；轮询间隔可用 `SCHEDULED_APPROVAL_POLL_SECONDS` 调整，
@@ -1943,11 +2003,11 @@ curl -s -X POST http://localhost:8000/api/applications/{近处许可}/revoke \
 │   ├── adjudication.py         # 纯函数：圆/时段/频段/保护带宽裁决、管制窗口命中判定（含组内两两、有效集成对检查、含窗口闭禁区的可用下界区间求解）
 │   ├── semantic_validation.py  # 整笔拒收的跨字段语义校验（含拟定带宽、候选下界区间与管制窗口形状/过期校验）
 │   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest、Suspension/ResumptionRequest、GuardBand*Request、AvailableRangesRequest、WaitlistRegistrationRequest、RestrictionWindow*Request、LicenseTransfer*Request）
-│   ├── models.py               # SQLAlchemy 表（申请 + 批准/暂停/恢复/撤销/带宽/管制窗口/许可交接事件 + 生效管制窗口 + 候补队列 + 修订号/当前带宽；含候选收窄索引）
-│   ├── db.py                   # 引擎、等待数据库、建表与旧库列/收窄索引升级、修订号与带宽初值初始化（重启不覆盖）
+│   ├── models.py               # SQLAlchemy 表（申请 + 批准/暂停/恢复/撤销/带宽/管制窗口/许可交接事件 + 生效管制窗口 + 候补队列 + 预约及其生命周期事件 + 修订号/当前带宽；含候选收窄索引）
+│   ├── db.py                   # 引擎、等待数据库、建表与旧库列/收窄索引/预约事件回填升级、修订号与带宽初值初始化（重启不覆盖）
 │   ├── config.py               # 环境变量配置（GUARD_BAND 仅作建库初值）
 │   └── errors.py               # 统一错误信封
-├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite，含 test_waitlist.py 候补用例、test_restriction_windows*.py 管制窗口用例、test_candidate_narrowing.py 候选收窄边界用例）
+├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite，含 test_waitlist.py 候补用例、test_restriction_windows*.py 管制窗口用例、test_candidate_narrowing.py 候选收窄边界用例、test_scheduled_approval_revisions.py 预约修订回放用例）
 ├── examples/walkthrough.sh     # curl 走查脚本
 ├── examples/candidate-narrowing.sh # 大量时段不相交许可下的候选集收窄走查（本轮）
 ├── Dockerfile

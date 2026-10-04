@@ -228,6 +228,119 @@ def _ensure_emergency_columns() -> None:
             )
 
 
+def _ensure_scheduled_approval_events() -> None:
+    """Backfill lifecycle events for appointments predating the event stream.
+
+    ``create_all`` creates the ``scheduled_approval_events`` table itself;
+    this seeds the immutable events for every legacy ``scheduled_approvals``
+    row that has none yet, so historical revision snapshots keep listing it.
+    Booking, rescheduling, cancellation and processing-time blocks consumed
+    no revision, so their exact decision revision is unknowable for legacy
+    rows: their events pin at revision 0 (visible in every snapshot, exactly
+    how those rows were presented before the event stream existed).  A due
+    approval pins at its recorded ``approval_revision`` and an invalidation
+    at the revision of the application's approval event (the decision that
+    superseded the appointment).  Rows that already have events are skipped,
+    so the backfill runs once and never touches post-upgrade history.
+    """
+    from .models import (
+        ApprovalEvent,
+        ScheduledApproval,
+        ScheduledApprovalEvent,
+    )
+
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if (
+        "scheduled_approvals" not in tables
+        or "scheduled_approval_events" not in tables
+    ):
+        return
+    with SessionLocal() as session, session.begin():
+        known = {
+            row_id
+            for (row_id,) in session.query(
+                ScheduledApprovalEvent.scheduled_approval_id
+            ).distinct()
+        }
+        rows = (
+            session.query(ScheduledApproval)
+            .order_by(ScheduledApproval.id)
+            .all()
+        )
+        for row in rows:
+            if row.id in known:
+                continue
+            session.add(
+                ScheduledApprovalEvent(
+                    scheduled_approval_id=row.id,
+                    application_id=row.application_id,
+                    revision=0,
+                    event_type="booked",
+                    scheduled_at=row.scheduled_at,
+                    reason=row.reason,
+                    created_at=row.created_at,
+                )
+            )
+            if row.status == "approved":
+                session.add(
+                    ScheduledApprovalEvent(
+                        scheduled_approval_id=row.id,
+                        application_id=row.application_id,
+                        revision=row.approval_revision or 0,
+                        event_type="approved",
+                        processed_at=row.processed_at,
+                        processed_guard_band=row.processed_guard_band,
+                        approval_revision=row.approval_revision,
+                        created_at=row.updated_at,
+                    )
+                )
+            elif row.status == "invalidated":
+                # The application was decided by another path; its (single)
+                # approval event carries the deciding revision.
+                deciding = (
+                    session.query(ApprovalEvent)
+                    .filter(
+                        ApprovalEvent.application_id == row.application_id
+                    )
+                    .first()
+                )
+                session.add(
+                    ScheduledApprovalEvent(
+                        scheduled_approval_id=row.id,
+                        application_id=row.application_id,
+                        revision=deciding.revision if deciding else 0,
+                        event_type="invalidated",
+                        outcome_reason=row.outcome_reason,
+                        created_at=row.updated_at,
+                    )
+                )
+            elif row.status == "blocked":
+                session.add(
+                    ScheduledApprovalEvent(
+                        scheduled_approval_id=row.id,
+                        application_id=row.application_id,
+                        revision=0,
+                        event_type="blocked",
+                        processed_at=row.processed_at,
+                        processed_guard_band=row.processed_guard_band,
+                        blocked_details=row.blocked_details,
+                        created_at=row.updated_at,
+                    )
+                )
+            elif row.status == "cancelled":
+                session.add(
+                    ScheduledApprovalEvent(
+                        scheduled_approval_id=row.id,
+                        application_id=row.application_id,
+                        revision=0,
+                        event_type="cancelled",
+                        outcome_reason=row.outcome_reason,
+                        created_at=row.updated_at,
+                    )
+                )
+
+
 def init_db() -> None:
     """Create tables and seed the singleton revision row (revision 0).
 
@@ -246,6 +359,7 @@ def init_db() -> None:
     _ensure_approval_event_waitlist_columns()
     _ensure_emergency_columns()
     _ensure_narrowing_indexes()
+    _ensure_scheduled_approval_events()
     with SessionLocal() as session, session.begin():
         meta = session.get(RevisionMeta, 1)
         if meta is None:

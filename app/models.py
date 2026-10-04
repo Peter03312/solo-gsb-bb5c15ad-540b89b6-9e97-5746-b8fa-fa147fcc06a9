@@ -58,6 +58,22 @@ History is event-sourced:
                            application stays pending and no revision is used).
                            The approval itself is an ordinary
                            ``approval_events`` row flagged ``scheduled``;
+* ``scheduled_approval_events`` - append-only lifecycle record of the
+                           appointments (``booked`` / ``rescheduled`` /
+                           ``cancelled`` / ``approved`` / ``blocked`` /
+                           ``invalidated``).  Every row is pinned to the
+                           revision from which its state becomes visible:
+                           booking/rescheduling/cancellation consume no
+                           revision and pin at the current revision of their
+                           operation, a due approval pins at the revision it
+                           consumes, a block pins at the revision current
+                           when the sweep decides it, and an invalidation
+                           pins at the revision of the approval that decided
+                           the application through another path.  Historical
+                           revision snapshots replay these rows instead of
+                           reading the mutable ``scheduled_approvals`` row,
+                           so a later decision never rewrites an earlier
+                           revision's view;
 * ``revision_meta``      - singleton row holding the current revision number
                            and the guard band currently in force.
 
@@ -669,4 +685,81 @@ class ScheduledApproval(Base):
             "status",
             "scheduled_at",
         ),
+    )
+
+
+class ScheduledApprovalEvent(Base):
+    """Append-only lifecycle record of one appointment, pinned to a revision.
+
+    Every state transition of a :class:`ScheduledApproval` appends exactly
+    one row here, carrying the revision from which the new state is visible
+    in historical snapshots:
+
+    * ``booked`` / ``rescheduled`` / ``cancelled`` consume **no** revision;
+      they pin at the current revision of their operation, so a snapshot at
+      that same revision already presents them (these operations always show
+      their effect within the revision they ran in);
+    * ``approved`` pins at the revision the due processing consumed for the
+      ordinary approval event (its ``approval_revision``);
+    * ``blocked`` consumes no revision and pins at the revision current when
+      the sweep recorded the blockers;
+    * ``invalidated`` pins at the revision of the approval that decided the
+      application through another path (manual single/batch approval,
+      waitlist auto-approval, handover successor approval or emergency
+      occupation approval).
+
+    Historical revision snapshots replay these rows in primary-key order and
+    never read the mutable ``scheduled_approvals`` row: an appointment booked
+    later is absent from earlier revisions, and an outcome is visible only
+    from its own decision revision onwards (older revisions still present the
+    appointment as waiting to fire, without leaking its approval revision).
+    """
+
+    __tablename__ = "scheduled_approval_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scheduled_approval_id: Mapped[int] = mapped_column(
+        ForeignKey("scheduled_approvals.id"), nullable=False
+    )
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    # Revision from which this state is visible (see the class docstring).
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    # booked / rescheduled / cancelled / approved / blocked / invalidated
+    event_type: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    # booked / rescheduled: the (new) booked UTC instant and operator reason.
+    scheduled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # cancelled / invalidated: why the appointment ended without firing.
+    outcome_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # approved / blocked: the processing instant and the band it used.
+    processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    processed_guard_band: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    # approved: the revision of the ordinary scheduled approval event.
+    approval_revision: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    # blocked: the blockers captured at processing time (same shape as a
+    # pending preview's conflicts / restriction-window hits).
+    blocked_details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_scheduled_approval_events_booking",
+            "scheduled_approval_id",
+            "revision",
+        ),
+        Index("ix_scheduled_approval_events_application", "application_id"),
     )

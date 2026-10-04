@@ -207,6 +207,19 @@ waitlist auto-approval, a handover or an emergency occupation --
 invalidates the waiting appointment in the same transaction, so due
 processing, cancellation, rescheduling and other decisions compete under
 one lock and exactly one outcome wins; a restart never double-approves.
+
+Every appointment transition also appends an immutable
+``scheduled_approval_events`` row pinned to the revision the new state
+becomes visible at: booking, rescheduling and cancellation consume no
+revision and pin at the current revision of their operation (a snapshot at
+that same revision already presents them); a due approval pins at the
+revision it consumes; a processing-time block pins at the revision current
+when the sweep records it; an invalidation pins at the deciding approval's
+revision.  Revision snapshots replay these rows instead of reading the
+mutable appointment row, so an appointment booked later is absent from
+earlier revisions and an outcome is only visible from its own decision
+revision onwards -- older revisions still present the appointment as
+waiting to fire, without leaking its approval revision.
 """
 from __future__ import annotations
 
@@ -241,6 +254,7 @@ from .models import (
     RevisionMeta,
     RevocationEvent,
     ScheduledApproval,
+    ScheduledApprovalEvent,
     SuspensionEvent,
     WaitlistEntry,
 )
@@ -1200,7 +1214,7 @@ def drain_waitlist(
         # scheduled appointment is invalidated in the same transaction so it
         # can never fire afterwards.
         invalidate_scheduled_approvals(
-            session, row.id, "waitlist_auto_approval"
+            session, row.id, "waitlist_auto_approval", meta.revision
         )
         newly_effective.append(candidate)
         newly_effective_ids.add(row.id)
@@ -1254,8 +1268,50 @@ SCHEDULED_TERMINAL_STATES = (
 )
 
 
+def _append_schedule_event(
+    session,
+    booking: ScheduledApproval,
+    event_type: str,
+    revision: int,
+    *,
+    at: datetime,
+    scheduled_at: datetime | None = None,
+    reason: str | None = None,
+    outcome_reason: str | None = None,
+    processed_at: datetime | None = None,
+    processed_guard_band: float | None = None,
+    approval_revision: int | None = None,
+    blocked_details: dict | None = None,
+) -> None:
+    """Append the immutable lifecycle event of one appointment transition.
+
+    ``revision`` is the revision from which the new state is visible in
+    historical snapshots: the current revision for operations that consume
+    none (booking/rescheduling/cancellation, a processing-time block), the
+    consumed revision for a due approval, and the deciding approval's
+    revision for an invalidation.  ``at`` is the wall-clock instant recorded
+    on the event (and reused by the caller for the live row's timestamps).
+    """
+    session.add(
+        ScheduledApprovalEvent(
+            scheduled_approval_id=booking.id,
+            application_id=booking.application_id,
+            revision=revision,
+            event_type=event_type,
+            scheduled_at=scheduled_at,
+            reason=reason,
+            outcome_reason=outcome_reason,
+            processed_at=processed_at,
+            processed_guard_band=processed_guard_band,
+            approval_revision=approval_revision,
+            blocked_details=blocked_details,
+            created_at=at,
+        )
+    )
+
+
 def invalidate_scheduled_approvals(
-    session, application_id: int, reason: str
+    session, application_id: int, reason: str, revision: int
 ) -> list[ScheduledApproval]:
     """Invalidate every still-waiting appointment of a decided application.
 
@@ -1263,7 +1319,10 @@ def invalidate_scheduled_approvals(
     another path (manual single/batch approval, waitlist auto-approval during
     a suspend/revoke/emergency-release drain, handover successor approval or
     an emergency occupation).  Only ``scheduled`` rows move; already terminal
-    appointments are left untouched.  Returns the rows invalidated.
+    appointments are left untouched.  Each invalidated row appends an
+    immutable event pinned at ``revision`` (the deciding approval's
+    revision), so historical snapshots before that revision still show the
+    appointment waiting to fire.  Returns the rows invalidated.
     """
     rows = (
         session.query(ScheduledApproval)
@@ -1273,10 +1332,19 @@ def invalidate_scheduled_approvals(
         )
         .all()
     )
+    now = datetime.now(timezone.utc)
     for row in rows:
         row.status = SCHEDULED_INVALIDATED
         row.outcome_reason = reason
-        row.updated_at = datetime.now(timezone.utc)
+        row.updated_at = now
+        _append_schedule_event(
+            session,
+            row,
+            "invalidated",
+            revision,
+            at=now,
+            outcome_reason=reason,
+        )
     return rows
 
 
@@ -1382,7 +1450,7 @@ def process_due_scheduled_approvals(
             # Decided by another path first; that path invalidated the row.
             if row is not None:
                 invalidate_scheduled_approvals(
-                    session, row.id, f"application_{row.status}"
+                    session, row.id, f"application_{row.status}", meta.revision
                 )
             continue
 
@@ -1400,7 +1468,10 @@ def process_due_scheduled_approvals(
 
         if conflicts or window_hits:
             # Blocked at processing time: stay pending, consume no revision,
-            # record the blockers once and never retry automatically.
+            # record the blockers once and never retry automatically.  The
+            # immutable event pins at the revision current right now (the
+            # block itself consumes none), so earlier revisions still show
+            # the appointment waiting to fire.
             booking.status = SCHEDULED_BLOCKED
             booking.blocked_details = {
                 "conflicts": [
@@ -1410,6 +1481,16 @@ def process_due_scheduled_approvals(
                     serialize_window_hit(h) for h in window_hits
                 ],
             }
+            _append_schedule_event(
+                session,
+                booking,
+                "blocked",
+                meta.revision,
+                at=current,
+                processed_at=current,
+                processed_guard_band=meta.guard_band,
+                blocked_details=booking.blocked_details,
+            )
             results.append(
                 {
                     "scheduled_approval_id": booking.id,
@@ -1447,6 +1528,19 @@ def process_due_scheduled_approvals(
         row.approval_revision = meta.revision
         booking.status = SCHEDULED_APPROVED
         booking.approval_revision = meta.revision
+        # The approval outcome becomes visible at the revision it consumed;
+        # earlier revisions keep showing the appointment as waiting and never
+        # leak the approval revision.
+        _append_schedule_event(
+            session,
+            booking,
+            "approved",
+            meta.revision,
+            at=current,
+            processed_at=current,
+            processed_guard_band=meta.guard_band,
+            approval_revision=meta.revision,
+        )
         results.append(
             {
                 "scheduled_approval_id": booking.id,
@@ -1712,6 +1806,86 @@ def transfer_preview_body(
 # --------------------------------------------------------------------------- #
 # Revision snapshots
 # --------------------------------------------------------------------------- #
+def replay_scheduled_approvals(
+    events: Iterable[ScheduledApprovalEvent],
+) -> list[dict[str, Any]]:
+    """As-of view of every appointment visible at the target revision.
+
+    ``events`` are the immutable lifecycle rows with ``revision <= target``
+    in primary-key (insertion) order.  An appointment appears once its
+    ``booked`` event is visible (appointments booked later are absent from
+    earlier revisions); terminal outcomes only show from the revision their
+    deciding event is pinned to, so older revisions still present the
+    appointment as waiting to fire and never leak its approval revision.
+    The record shape matches the live audit rows exactly.
+    """
+    by_booking: dict[int, list[ScheduledApprovalEvent]] = {}
+    for ev in events:
+        by_booking.setdefault(ev.scheduled_approval_id, []).append(ev)
+
+    records: list[dict[str, Any]] = []
+    for booking_id in sorted(by_booking):
+        record: dict[str, Any] | None = None
+        for ev in by_booking[booking_id]:
+            if ev.event_type == "booked":
+                record = {
+                    "id": booking_id,
+                    "application_id": ev.application_id,
+                    "scheduled_at": iso(ev.scheduled_at),
+                    "status": SCHEDULED_STATUS,
+                    "reason": ev.reason if ev.reason is not None else "",
+                    "processed_at": None,
+                    "approval_revision": None,
+                    "processed_guard_band": None,
+                    "blocked_details": None,
+                    "outcome_reason": None,
+                    "created_at": iso(ev.created_at),
+                    "updated_at": iso(ev.created_at),
+                }
+            elif record is None:
+                # Defensive: a lifecycle event whose booking is not visible
+                # yet cannot occur (the booked event is always written first
+                # and pins at the earliest revision of the appointment).
+                continue
+            elif ev.event_type == "rescheduled":
+                record["scheduled_at"] = iso(ev.scheduled_at)
+                record["reason"] = (
+                    ev.reason if ev.reason is not None else ""
+                )
+                record["updated_at"] = iso(ev.created_at)
+            elif ev.event_type == "cancelled":
+                record["status"] = SCHEDULED_CANCELLED
+                record["outcome_reason"] = ev.outcome_reason
+                record["updated_at"] = iso(ev.created_at)
+            elif ev.event_type == "approved":
+                record["status"] = SCHEDULED_APPROVED
+                record["processed_at"] = (
+                    iso(ev.processed_at)
+                    if ev.processed_at is not None
+                    else None
+                )
+                record["approval_revision"] = ev.approval_revision
+                record["processed_guard_band"] = ev.processed_guard_band
+                record["updated_at"] = iso(ev.created_at)
+            elif ev.event_type == "blocked":
+                record["status"] = SCHEDULED_BLOCKED
+                record["processed_at"] = (
+                    iso(ev.processed_at)
+                    if ev.processed_at is not None
+                    else None
+                )
+                record["processed_guard_band"] = ev.processed_guard_band
+                record["blocked_details"] = ev.blocked_details
+                record["updated_at"] = iso(ev.created_at)
+            elif ev.event_type == "invalidated":
+                record["status"] = SCHEDULED_INVALIDATED
+                record["outcome_reason"] = ev.outcome_reason
+                record["updated_at"] = iso(ev.created_at)
+        if record is not None:
+            records.append(record)
+    return records
+
+
 def guard_band_at(session, revision: int) -> float:
     """Guard band in force at ``revision`` (latest change at or before it)."""
     event = (
@@ -1738,7 +1912,9 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
     events of the period, plus the guard band in force at that revision and
     the guard-band records behind it.  Original approval events are never
     rewritten: a resumption is a separate event carrying its own band
-    snapshot.
+    snapshot.  The scheduled-approval audit rows are likewise replayed from
+    their immutable lifecycle events (see :func:`replay_scheduled_approvals`),
+    never read from the mutable appointment rows.
     """
     approvals = (
         session.query(ApprovalEvent)
@@ -1788,9 +1964,10 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         .order_by(EmergencyOccupation.id)
         .all()
     )
-    scheduled_rows = (
-        session.query(ScheduledApproval)
-        .order_by(ScheduledApproval.id)
+    scheduled_events = (
+        session.query(ScheduledApprovalEvent)
+        .filter(ScheduledApprovalEvent.revision <= revision)
+        .order_by(ScheduledApprovalEvent.id)
         .all()
     )
 
@@ -2184,31 +2361,15 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         "resumptions": resumption_records,
         "revocations": revocation_records,
         "license_transfers": transfer_records,
-        # Operator-booked auto-approval appointments.  Bookings consume no
-        # revision, so the audit lists every appointment row; a scheduled
-        # *approval* itself is already one of the ordinary approval records
-        # above, flagged ``scheduled: true``.
-        "scheduled_approvals": [
-            {
-                "id": booking.id,
-                "application_id": booking.application_id,
-                "scheduled_at": iso(booking.scheduled_at),
-                "status": booking.status,
-                "reason": booking.reason,
-                "processed_at": (
-                    iso(booking.processed_at)
-                    if booking.processed_at is not None
-                    else None
-                ),
-                "approval_revision": booking.approval_revision,
-                "processed_guard_band": booking.processed_guard_band,
-                "blocked_details": booking.blocked_details,
-                "outcome_reason": booking.outcome_reason,
-                "created_at": iso(booking.created_at),
-                "updated_at": iso(booking.updated_at),
-            }
-            for booking in scheduled_rows
-        ],
+        # Operator-booked auto-approval appointments, replayed from their
+        # immutable lifecycle events as of the target revision: appointments
+        # booked later are absent, and an outcome (approved / blocked /
+        # cancelled / invalidated) is only visible from the revision its
+        # deciding event is pinned to -- earlier revisions still show the
+        # appointment waiting to fire, with no approval revision leaked.
+        # A scheduled *approval* itself is already one of the ordinary
+        # approval records above, flagged ``scheduled: true``.
+        "scheduled_approvals": replay_scheduled_approvals(scheduled_events),
     }
 
 
@@ -3171,7 +3332,7 @@ def approve_application(
                     session.delete(entry)
                 # A manual decision supersedes any booked appointment.
                 invalidate_scheduled_approvals(
-                    session, application_id, "manual_approval"
+                    session, application_id, "manual_approval", meta.revision
                 )
                 session.flush()
                 response = {
@@ -3434,7 +3595,7 @@ def batch_approve_applications(payload: BatchApprovalRequest) -> dict[str, Any]:
                         session.delete(entry)
                     # A manual decision supersedes any booked appointment.
                     invalidate_scheduled_approvals(
-                        session, row.id, "batch_approval"
+                        session, row.id, "batch_approval", meta.revision
                     )
                     results.append(
                         {
@@ -4176,15 +4337,30 @@ def _book_or_reschedule_schedule(
 
         existing = get_active_schedule(session, application_id)
         scheduled_at = payload.scheduled_at.astimezone(timezone.utc)
+        current = session.get(RevisionMeta, 1).revision
         if existing is None:
             booking = ScheduledApproval(
                 application_id=application_id,
                 scheduled_at=scheduled_at,
                 status=SCHEDULED_STATUS,
                 reason=payload.reason,
+                created_at=now,
+                updated_at=now,
             )
             session.add(booking)
             session.flush()
+            # Booking consumes no revision: the immutable event pins at the
+            # current revision, so the appointment is visible from this
+            # revision onwards and absent from every earlier one.
+            _append_schedule_event(
+                session,
+                booking,
+                "booked",
+                current,
+                at=now,
+                scheduled_at=scheduled_at,
+                reason=payload.reason,
+            )
             action = "booked"
             http_status = 201
         else:
@@ -4193,9 +4369,20 @@ def _book_or_reschedule_schedule(
             existing.updated_at = now
             booking = existing
             session.flush()
+            # Rescheduling consumes no revision either: the new instant is
+            # presented from the current revision onwards; earlier revisions
+            # keep the previously booked instant.
+            _append_schedule_event(
+                session,
+                booking,
+                "rescheduled",
+                current,
+                at=now,
+                scheduled_at=scheduled_at,
+                reason=payload.reason,
+            )
             action = "rescheduled"
             http_status = 200
-        current = session.get(RevisionMeta, 1).revision
         body = {
             action: True,
             "action": action,
@@ -4283,6 +4470,17 @@ def reschedule_scheduled_approval(
         existing.updated_at = now
         session.flush()
         current = session.get(RevisionMeta, 1).revision
+        # Same pinning rule as rebooking: the new instant is presented from
+        # the current revision onwards.
+        _append_schedule_event(
+            session,
+            existing,
+            "rescheduled",
+            current,
+            at=now,
+            scheduled_at=existing.scheduled_at,
+            reason=existing.reason,
+        )
         return {
             "rescheduled": True,
             "id": existing.id,
@@ -4342,9 +4540,21 @@ def cancel_scheduled_approval(
             )
         existing.status = SCHEDULED_CANCELLED
         existing.outcome_reason = reason
-        existing.updated_at = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
+        existing.updated_at = now
         session.flush()
         current = session.get(RevisionMeta, 1).revision
+        # Cancelling consumes no revision: the cancelled state is presented
+        # from the current revision onwards; earlier revisions still show
+        # the appointment waiting to fire.
+        _append_schedule_event(
+            session,
+            existing,
+            "cancelled",
+            current,
+            at=now,
+            outcome_reason=reason,
+        )
         return {
             "cancelled": True,
             "id": existing.id,
@@ -5362,7 +5572,10 @@ def confirm_license_transfer(
                 # The handover decides the successor: its booked appointment
                 # (if any) is superseded in the same transaction.
                 invalidate_scheduled_approvals(
-                    session, successor.id, "license_transfer"
+                    session,
+                    successor.id,
+                    "license_transfer",
+                    successor_revision,
                 )
 
                 # The audit link between the two revisions of the handover.
@@ -5649,7 +5862,7 @@ def confirm_emergency_occupation(
                 # The emergency occupation decides the application: any
                 # booked appointment is superseded in the same transaction.
                 invalidate_scheduled_approvals(
-                    session, row.id, "emergency_occupation"
+                    session, row.id, "emergency_occupation", approval_revision
                 )
 
                 occupation = EmergencyOccupation(
