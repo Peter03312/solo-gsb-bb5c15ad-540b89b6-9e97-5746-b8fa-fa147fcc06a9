@@ -713,3 +713,246 @@ class TestQueries:
         cancel(client, a)
         body = client.get("/api/revision/current").json()
         assert body["scheduled_approval_ids"] == []
+
+
+class TestRevisionVisibility:
+    """Appointments in as-of revision snapshots must not time-travel.
+
+    A booking consumes no revision, so an appointment is visible only from
+    the revision in force when it was booked; terminal outcomes (due
+    approval, block, cancellation, invalidation by single/batch/waitlist/
+    handover/emergency decisions) show only from their deciding revision,
+    and the approval revision never leaks into earlier revisions.
+    """
+
+    def snapshot_schedules(self, client, revision):
+        body = client.get(f"/api/revision/{revision}").json()
+        return {row["application_id"]: row for row in body["scheduled_approvals"]}
+
+    def test_invalidation_does_not_leak_into_earlier_revision(self, client):
+        # The audit-traversal bug from the report: booked at revision 0,
+        # manually approved (invalidating the appointment) at revision 1;
+        # the revision-0 snapshot must still show the waiting appointment.
+        a = submit(client, 100, 110, "A")
+        booking_id = book(client, a, NOW + timedelta(days=1)).json()[
+            "scheduled_approval_id"
+        ]
+        approve(client, a, 0)  # revision 1
+        old = self.snapshot_schedules(client, 0)[a]
+        new = self.snapshot_schedules(client, 1)[a]
+        assert old["id"] == booking_id
+        assert old["status"] == "scheduled"
+        assert old["approval_revision"] is None
+        assert old["processed_at"] is None
+        assert old["outcome_reason"] is None
+        assert old["outcome_revision"] is None
+        assert old["booked_revision"] == 0
+        assert new["status"] == "invalidated"
+        assert new["outcome_reason"] == "manual_approval"
+        assert new["outcome_revision"] == 1
+
+    def test_appointment_booked_later_is_absent_from_earlier_revision(
+        self, client
+    ):
+        a = submit(client, 100, 110, "A")
+        approve(client, a, 0)  # advance to revision 1
+        b = submit(client, 200, 210, "B")
+        book(client, b, NOW + timedelta(days=1))
+        assert b not in self.snapshot_schedules(client, 0)
+        row = self.snapshot_schedules(client, 1)[b]
+        assert row["status"] == "scheduled"
+        assert row["booked_revision"] == 1
+
+    def test_cancel_in_same_revision_shows_current_state(self, client):
+        # Booking and cancellation both happen while revision 0 is in force
+        # (neither consumes a revision): the revision-0 window shows the
+        # current shape, i.e. cancelled.
+        a = submit(client, 100, 110, "A")
+        book(client, a, NOW + timedelta(days=1))
+        cancel(client, a)
+        other = submit(client, 200, 210, "other")
+        approve(client, other, 0)  # revision 1
+        assert self.snapshot_schedules(client, 0)[a]["status"] == "cancelled"
+        assert self.snapshot_schedules(client, 1)[a]["status"] == "cancelled"
+
+    def test_cancel_then_revision_advances_old_snapshot_kept_consistent(
+        self, client
+    ):
+        # Booking at revision 0, an unrelated approval makes revision 1, then
+        # cancel at revision 1: revision 0 must still show the waiting row.
+        a = submit(client, 100, 110, "A")
+        book(client, a, NOW + timedelta(days=1))
+        other = submit(client, 200, 210, "other")
+        approve(client, other, 0)  # revision 1
+        cancel(client, a)
+        assert self.snapshot_schedules(client, 0)[a]["status"] == "scheduled"
+        row = self.snapshot_schedules(client, 1)[a]
+        assert row["status"] == "cancelled"
+        assert row["outcome_reason"] == "never mind"
+        assert row["outcome_revision"] == 1
+
+    def test_reschedule_keeps_old_instant_in_earlier_revision(self, client):
+        a = submit(client, 100, 110, "A")
+        old_when = NOW + timedelta(days=1)
+        book(client, a, old_when, reason="first")
+        other = submit(client, 200, 210, "other")
+        approve(client, other, 0)  # revision 1
+        new_when = NOW + timedelta(days=2)
+        reschedule(client, a, new_when, reason="moved")
+        old = self.snapshot_schedules(client, 0)[a]
+        new = self.snapshot_schedules(client, 1)[a]
+        assert old["scheduled_at"] == iso(old_when)
+        assert old["reason"] == "first"
+        assert old["status"] == "scheduled"
+        assert new["scheduled_at"] == iso(new_when)
+        assert new["reason"] == "moved"
+
+    def test_two_reschedules_within_one_revision_show_latest(self, client):
+        # Non-revision operations inside one revision window collapse to the
+        # latest current state.
+        a = submit(client, 100, 110, "A")
+        first = NOW + timedelta(days=1)
+        second = NOW + timedelta(days=2)
+        book(client, a, first, reason="one")
+        reschedule(client, a, second, reason="two")
+        row = self.snapshot_schedules(client, 0)[a]
+        assert row["scheduled_at"] == iso(second)
+        assert row["reason"] == "two"
+
+    def test_due_approval_hidden_before_its_revision(self, client):
+        a = submit(client, 100, 110, "A")
+        booking_id = book_due(client, a)
+        summary = process_due(client)
+        approval_revision = summary["results"][0]["revision"]
+        before = self.snapshot_schedules(client, approval_revision - 1)[a]
+        at = self.snapshot_schedules(client, approval_revision)[a]
+        assert before["status"] == "scheduled"
+        assert before["approval_revision"] is None
+        assert before["processed_at"] is None
+        assert before["processed_guard_band"] is None
+        assert at["id"] == booking_id
+        assert at["status"] == "approved"
+        assert at["approval_revision"] == approval_revision
+        assert at["processed_at"] is not None
+        assert at["processed_guard_band"] == 2.0
+        assert at["outcome_revision"] == approval_revision
+        # The ordinary approval record exists only from its revision on.
+        assert client.get(f"/api/revision/{approval_revision - 1}").json()[
+            "approvals"
+        ] == []
+
+    def test_block_visible_only_from_revision_in_force(self, client):
+        lic = submit(client, 100, 110, "lic")
+        approve(client, lic, 0)  # revision 1
+        blocked = submit(client, 105, 108, "B")
+        book_due(client, blocked)  # booked while revision 1 in force
+        process_due(client)  # blocks; consumes no revision
+        assert blocked not in self.snapshot_schedules(client, 0)
+        row = self.snapshot_schedules(client, 1)[blocked]
+        assert row["status"] == "blocked"
+        assert row["blocked_details"]["conflicts"]
+        assert row["approval_revision"] is None
+
+    def test_batch_invalidation_per_member_revision(self, client):
+        a = submit(client, 100, 110, "A")
+        b = submit(client, 200, 210, "B")
+        book(client, a, NOW + timedelta(days=1))
+        book(client, b, NOW + timedelta(days=1))
+        r = client.post(
+            "/api/applications/batch-approve",
+            json={"expected_revision": 0, "application_ids": [a, b]},
+        )
+        assert r.status_code == 200, r.text
+        revs = {
+            row["application_id"]: row["revision"]
+            for row in r.json()["results"]
+        }
+        assert self.snapshot_schedules(client, revs[a] - 1)[a][
+            "status"
+        ] == "scheduled"
+        assert self.snapshot_schedules(client, revs[a])[a][
+            "status"
+        ] == "invalidated"
+        # B is still waiting in A's revision; its own outcome appears at B's.
+        assert self.snapshot_schedules(client, revs[a])[b][
+            "status"
+        ] == "scheduled"
+        assert self.snapshot_schedules(client, revs[b])[b][
+            "status"
+        ] == "invalidated"
+
+    def test_waitlist_invalidation_visible_from_auto_approval_revision(
+        self, client
+    ):
+        lic = submit(client, 100, 110, "lic")
+        approve(client, lic, 0)
+        b = submit(client, 105, 108, "B")
+        client.post(f"/api/applications/{b}/waitlist")
+        book(client, b, NOW + timedelta(days=1))
+        r = client.post(f"/api/applications/{lic}/revoke", json={"reason": "x"})
+        assert r.status_code == 200, r.text
+        auto_rev = r.json()["auto_approvals"][0]["revision"]
+        # The release revision precedes the auto-approval revision.
+        assert self.snapshot_schedules(client, auto_rev - 1)[b][
+            "status"
+        ] == "scheduled"
+        row = self.snapshot_schedules(client, auto_rev)[b]
+        assert row["status"] == "invalidated"
+        assert row["outcome_reason"] == "waitlist_auto_approval"
+        assert row["outcome_revision"] == auto_rev
+
+    def test_license_transfer_invalidation_visible_from_successor_revision(
+        self, client
+    ):
+        source = submit(client, 100, 110, "source")
+        approve(client, source, 0)
+        successor = submit(client, 100, 110, "successor")
+        book(client, successor, NOW + timedelta(days=1))
+        r = client.post(
+            "/api/license-transfers",
+            json={
+                "source_application_id": source,
+                "successor_application_id": successor,
+                "expected_revision": 1,
+                "reason": "swap",
+            },
+        )
+        assert r.status_code == 200, r.text
+        successor_rev = r.json()["successor_approval_revision"]
+        assert self.snapshot_schedules(client, successor_rev - 1)[successor][
+            "status"
+        ] == "scheduled"
+        row = self.snapshot_schedules(client, successor_rev)[successor]
+        assert row["status"] == "invalidated"
+        assert row["outcome_reason"] == "license_transfer"
+
+    def test_emergency_invalidation_visible_from_emergency_revision(
+        self, client
+    ):
+        e = submit(client, 100, 110, "emergency")
+        book(client, e, NOW + timedelta(days=1))
+        r = client.post(
+            "/api/emergency-occupations",
+            json={
+                "application_id": e,
+                "expected_revision": 0,
+                "reason": "burst",
+            },
+        )
+        assert r.status_code == 201, r.text
+        emergency_rev = r.json()["emergency_approval_revision"]
+        before = self.snapshot_schedules(client, emergency_rev - 1)[e]
+        at = self.snapshot_schedules(client, emergency_rev)[e]
+        assert before["status"] == "scheduled"
+        assert at["status"] == "invalidated"
+        assert at["outcome_reason"] == "emergency_occupation"
+
+    def test_history_is_read_only(self, client):
+        a = submit(client, 100, 110, "A")
+        book(client, a, NOW + timedelta(days=1))
+        approve(client, a, 0)
+        before = client.get("/api/revision/0").json()
+        # Repeated reads return identical content; current revision unchanged.
+        again = client.get("/api/revision/0").json()
+        assert again == before
+        assert client.get("/api/revision/current").json()["current_revision"] == 1

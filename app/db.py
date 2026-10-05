@@ -228,6 +228,123 @@ def _ensure_emergency_columns() -> None:
             )
 
 
+def _ensure_scheduled_approval_visibility_columns() -> None:
+    """Add revision-visibility columns/table for appointment audit.
+
+    Older databases stored only the mutable, always-current appointment row,
+    which let later outcomes (e.g. an invalidation at revision 1) leak into
+    as-of snapshots of earlier revisions.  ``create_all`` only creates
+    missing tables, so the ``scheduled_approval_changes`` journal is created
+    normally and the three nullable/default columns on
+    ``scheduled_approvals`` are added idempotently; ``init_db`` then
+    backfills them from the live event stream.
+    """
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    with engine.begin() as conn:
+        if "scheduled_approvals" in existing_tables:
+            columns = {
+                col["name"]
+                for col in inspector.get_columns("scheduled_approvals")
+            }
+            if "booked_revision" not in columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE scheduled_approvals "
+                        "ADD COLUMN booked_revision INTEGER NOT NULL DEFAULT 0"
+                    )
+                )
+            if "outcome_revision" not in columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE scheduled_approvals "
+                        "ADD COLUMN outcome_revision INTEGER"
+                    )
+                )
+            if "outcome_at" not in columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE scheduled_approvals "
+                        "ADD COLUMN outcome_at TIMESTAMP WITH TIME ZONE"
+                    )
+                )
+
+
+def _backfill_scheduled_approval_visibility(session) -> None:
+    """Backfill appointment visibility columns on pre-upgrade databases.
+
+    New databases already populate ``booked_revision`` / ``outcome_revision``
+    / ``outcome_at`` while booking and deciding appointments.  For rows
+    created before revision-aware audit existed, derive the best-effort
+    values from the immutable event stream: an approved appointment takes
+    the revision of its scheduled approval event; every other terminal row
+    (blocked/cancelled/invalidated) is treated as decided at the revision
+    currently in force (its exact deciding revision was never recorded), and
+    waiting rows simply become visible from revision 0.  A booking journal
+    entry is also inserted once per legacy row so revision snapshots have a
+    baseline shape.  Backfill is idempotent (skips rows already populated).
+    """
+    from .models import (
+        ApprovalEvent,
+        RevisionMeta,
+        ScheduledApproval,
+        ScheduledApprovalChange,
+    )
+
+    if session.get(RevisionMeta, 1) is None:
+        return
+    current_revision = session.get(RevisionMeta, 1).revision
+    rows = session.query(ScheduledApproval).all()
+    existing_journal = {
+        row_id
+        for (row_id,) in session.query(
+            ScheduledApprovalChange.scheduled_approval_id
+        ).distinct()
+    }
+    for booking in rows:
+        if booking.booked_revision is None:
+            booking.booked_revision = 0
+        if booking.outcome_revision is None and booking.status != "scheduled":
+            outcome_revision: int | None = None
+            outcome_at = booking.processed_at
+            if booking.status == "approved" and booking.approval_revision:
+                outcome_revision = booking.approval_revision
+            elif booking.status == "invalidated":
+                # The deciding event is the one that took the application out
+                # of pending: its first approval (manual, batch, waitlist,
+                # handover successor or emergency all append one).
+                event = (
+                    session.query(ApprovalEvent)
+                    .filter(
+                        ApprovalEvent.application_id
+                        == booking.application_id
+                    )
+                    .order_by(ApprovalEvent.revision.asc())
+                    .first()
+                )
+                outcome_revision = (
+                    event.revision if event is not None else current_revision
+                )
+            else:  # blocked / cancelled: no revision was consumed
+                outcome_revision = current_revision
+            booking.outcome_revision = outcome_revision
+            if outcome_at is None:
+                outcome_at = booking.updated_at
+            booking.outcome_at = outcome_at
+        if booking.id not in existing_journal:
+            session.add(
+                ScheduledApprovalChange(
+                    scheduled_approval_id=booking.id,
+                    application_id=booking.application_id,
+                    change_type="booked",
+                    revision=booking.booked_revision,
+                    scheduled_at=booking.scheduled_at,
+                    reason=booking.reason or "",
+                    created_at=booking.created_at,
+                )
+            )
+
+
 def init_db() -> None:
     """Create tables and seed the singleton revision row (revision 0).
 
@@ -246,6 +363,7 @@ def init_db() -> None:
     _ensure_approval_event_waitlist_columns()
     _ensure_emergency_columns()
     _ensure_narrowing_indexes()
+    _ensure_scheduled_approval_visibility_columns()
     with SessionLocal() as session, session.begin():
         meta = session.get(RevisionMeta, 1)
         if meta is None:
@@ -273,3 +391,4 @@ def init_db() -> None:
                     guard_band=meta.guard_band,
                 )
             )
+        _backfill_scheduled_approval_visibility(session)

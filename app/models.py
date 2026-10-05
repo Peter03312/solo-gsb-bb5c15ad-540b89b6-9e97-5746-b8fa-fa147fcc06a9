@@ -56,8 +56,19 @@ History is event-sourced:
                            time (re-adjudicated then: approved on one new
                            revision, or recorded blocked while the
                            application stays pending and no revision is used).
-                           The approval itself is an ordinary
-                           ``approval_events`` row flagged ``scheduled``;
+                           ``booked_revision`` marks the revision in force when
+                           the appointment became visible and ``outcome_revision``
+                           marks the first revision showing each terminal
+                           outcome, so as-of snapshots never leak later
+                           outcomes into earlier revisions.  The approval
+                           itself is an ordinary ``approval_events`` row
+                           flagged ``scheduled``;
+* ``scheduled_approval_changes`` - append-only booking/reschedule ledger for
+                           appointments.  Booking and rescheduling consume no
+                           revision; every row records the revision in force at
+                           the time and the booked instant/reason then chosen,
+                           so an as-of snapshot restores the exact appointment
+                           shape visible at that revision;
 * ``revision_meta``      - singleton row holding the current revision number
                            and the guard band currently in force.
 
@@ -605,6 +616,17 @@ class ScheduledApproval(Base):
     rescheduling, due processing and the other decisions therefore compete
     under one arbitration and exactly one outcome wins; a restart never
     approves the same appointment twice (only ``scheduled`` rows fire).
+
+    Revision visibility (bookings consume no revision): ``booked_revision``
+    is the revision in force when the appointment was booked (or rebooked),
+    and ``outcome_revision`` is the first revision from which each terminal
+    outcome is visible -- the approval revision when approved, the revision
+    in force when it was blocked/cancelled, or the deciding revision when
+    invalidated.  An as-of snapshot at revision R hides rows booked after R
+    and rewinds outcomes decided after R back to the still-waiting shape, so
+    a later decision (e.g. an invalidation at revision 1) never shows up at
+    an earlier revision.  Reschedules are journaled in
+    ``scheduled_approval_changes`` with the revision in force at each move.
     """
 
     __tablename__ = "scheduled_approvals"
@@ -614,7 +636,8 @@ class ScheduledApproval(Base):
         ForeignKey("applications.id"), nullable=False
     )
     # The booked UTC auto-approval instant; rescheduling overwrites it and
-    # bumps ``updated_at`` (the original booking time is kept for audit).
+    # bumps ``updated_at`` (every earlier instant is kept in
+    # ``scheduled_approval_changes`` for revision-accurate audit).
     scheduled_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -656,6 +679,26 @@ class ScheduledApproval(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
 
+    # Revision in force when the appointment became visible (booking/rebooking
+    # consumes no revision, so it is visible from this revision on).  Used by
+    # as-of snapshots to hide appointments booked in later revisions.
+    booked_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    # First revision from which the terminal status (approved/blocked/
+    # cancelled/invalidated) is visible.  NULL while still waiting: a
+    # cancellation/block uses the revision in force at that moment (the
+    # operation consumes no revision), an approval uses the revision it
+    # consumed and an invalidation uses the revision of the deciding event.
+    # Snapshots at smaller revisions rewind the row to ``scheduled``.
+    outcome_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # UTC instant the terminal status took effect (NULL while waiting); lets
+    # historical snapshots report the decision time without leaking later
+    # outcome fields.
+    outcome_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     __table_args__ = (
         Index(
             "uq_scheduled_approvals_active_application",
@@ -668,5 +711,48 @@ class ScheduledApproval(Base):
             "ix_scheduled_approvals_due",
             "status",
             "scheduled_at",
+        ),
+    )
+
+
+class ScheduledApprovalChange(Base):
+    """Append-only booking/reschedule journal of one appointment.
+
+    Neither booking nor rescheduling consumes a revision, but every entry
+    records the revision in force at that moment together with the booked
+    instant and reason then chosen.  An as-of snapshot at revision R
+    restores the latest entry with ``revision <= R`` (the booking entry is
+    the fallback), so a reschedule performed at a later revision never moves
+    the appointment in earlier revisions.  Same-revision moves overwrite one
+    another in the snapshot because the revision window includes the whole
+    revision: the latest state within a revision is what callers see.
+    """
+
+    __tablename__ = "scheduled_approval_changes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scheduled_approval_id: Mapped[int] = mapped_column(
+        ForeignKey("scheduled_approvals.id"), nullable=False
+    )
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    # "booked" or "rescheduled".
+    change_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    scheduled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_scheduled_approval_changes_lookup",
+            "scheduled_approval_id",
+            "revision",
+            "id",
         ),
     )

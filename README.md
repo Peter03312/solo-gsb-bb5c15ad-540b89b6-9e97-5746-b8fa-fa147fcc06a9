@@ -620,18 +620,43 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 批准（`emergency_occupation`）。取消、改期、到期处理与这些审批都在同一修订号锁上
 串行，因此**只允许一种结果生效**。
 
-**查询与历史**
+**查询与历史（按修订可见，杜绝审计穿越）**
 
 - `GET /api/scheduled-approvals?status=scheduled&application_id=…`：按状态/申请
-  过滤列出预约；状态取值 `scheduled`/`approved`/`blocked`/`cancelled`/`invalidated`。
+  过滤列出预约（实时当前状态）；状态取值
+  `scheduled`/`approved`/`blocked`/`cancelled`/`invalidated`。
 - `GET /api/scheduled-approvals/{id}`：返回预约状态、约定时刻、**实际处理时间**
   `processed_at`、获批时的 `approval_revision`/`processed_guard_band`，或阻塞时的
-  `blocked_details`；终态另附 `outcome_reason`。
+  `blocked_details`；终态另附 `outcome_reason`。所有预约行（实时与历史）还带
+  `booked_revision`（预约首次可见的修订号）与 `outcome_revision`（终态首次可见的
+  修订号；仍待执行时为 `null`）。
 - `GET /api/applications/{id}/scheduled-approvals`：单个申请的全部预约（含历史）。
 - `GET /api/revision/current` 追加 `scheduled_approval_ids`/`scheduled_approvals`
   （仅待执行项）；`GET /api/revision/{n}` 的批准记录追加 `scheduled` 标志，并附
   `scheduled_approvals[]` 预约审计行。**历史修订标明自动审批且保留原批准事件语义**：
   预约产生的批准是普通批准事件流中一行，只是多了 `scheduled` 标记，永不追改。
+
+预约的**登记、改期、取消都不占修订号**，但修订快照按下列规则还原，保证只读历史
+不发生审计穿越：
+
+- **后来才创建的预约不出现在较早修订**：每条预约记录 `booked_revision`（预约时的
+  当前修订号）；修订 N 的快照只含 `booked_revision <= N` 的预约。
+- **终态只从各自的决定修订起可见**：`outcome_revision` 标记终态首次出现的修订号——
+  到期获批取它占用的批准修订号；被单笔批准、整组批准、候补自动批准、许可交接接替
+  批准或紧急占用批准置为失效时，取该审批事件自身的修订号（整组中每项只在自己的
+  修订号失效）；到期阻塞与取消不占修订号，取操作时的当前修订号。查询更早修订时
+  该行**回绕为待执行 `scheduled`**，且不返回 `status` 之外的任何终态字段
+  （`approval_revision`/`processed_at`/`processed_guard_band`/`blocked_details`/
+  `outcome_reason` 均为 `null`），因此**审批修订号不会提前泄漏**。
+- **改期按修订还原**：每次改期在只追加的 `scheduled_approval_changes` 流水里记录
+  当时的修订号、约定时刻与原因；修订 N 的快照取修订号 `<= N` 的最后一条，后来的
+  改期不会挪动旧修订里的预约时刻。
+- **同一修订号内的不占号操作按当前状态呈现**：登记、改期、取消（以及到期阻塞）
+  若发生在同一修订号窗口内，该修订号的快照直接呈现窗口内的最新状态（例如修订 0
+  登记又取消，则修订 0 快照显示 `cancelled`）；跨修订号才做上述回绕。
+- 每个申请至多一条待执行预约（局部唯一索引）的规则不变；历史查询全程只读，
+  `GET /api/revision/{n}` 的既有字段、修订越界（未来修订 404、负修订 422）错误
+  完全兼容，新增的 `booked_revision`/`outcome_revision` 均为追加字段。
 
 ### 可用调频位置查询（不改状态）
 
@@ -1861,6 +1886,29 @@ curl -s -X POST http://localhost:8000/api/applications/4/approve \
   -H 'Content-Type: application/json' -d '{"expected_revision":3}'
 curl -s http://localhost:8000/api/scheduled-approvals/{预约ID}
 # -> status="invalidated", outcome_reason="manual_approval"；到期扫描不再处理它
+```
+
+修订可见性（防止审计穿越；历史查询只读）：
+
+```bash
+# 申请在修订 0 预约、修订 1 被手动批准并令预约失效后：
+curl -s http://localhost:8000/api/revision/0 | jq '.scheduled_approvals[0]
+  | {status, scheduled_at, approval_revision, processed_at,
+     outcome_reason, booked_revision, outcome_revision}'
+# {"status":"scheduled","approval_revision":null,"processed_at":null,
+#  "outcome_reason":null,"booked_revision":0,"outcome_revision":null}
+#   ^ 旧修订仍是“待执行”，审批修订号/失效原因都不泄漏
+curl -s http://localhost:8000/api/revision/1 | jq '.scheduled_approvals[0]
+  | {status, outcome_reason, booked_revision, outcome_revision}'
+# {"status":"invalidated","outcome_reason":"manual_approval",
+#  "booked_revision":0,"outcome_revision":1}
+#   ^ 失效只从决定修订（1）起显示
+
+# 修订 1 之后才登记的预约不会出现在修订 0/1：
+curl -s http://localhost:8000/api/revision/0 | jq '.scheduled_approvals
+  | map(select(.application_id == 9))'   # -> []
+# 改期同样按修订还原：修订 1 改到新时刻后，修订 0 快照仍是旧时刻与旧原因。
+# 同一修订号内的登记/改期/取消不占号，该修订快照直接呈现最新当前状态。
 ```
 
 启动可用性：服务重启时先对停机期间到期的预约做一次**补处理**（逻辑与
